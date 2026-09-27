@@ -30,7 +30,7 @@ import {
   type PaceOptions,
 } from './lib/pace';
 import { SAMPLE_A, SAMPLE_B } from './lib/samples';
-import { parseSrt, serializeSrt, type Cue } from './lib/srt';
+import { formatTimecode, parseSrt, serializeSrt, type Cue } from './lib/srt';
 import { applyScrollChains, findScrollChains, type ScrollOptions } from './lib/scroll';
 import {
   applySnaps,
@@ -40,12 +40,18 @@ import {
   type SnapOptions,
 } from './lib/snap';
 import { smartWrap, type WrapOptions } from './lib/wrap';
+import {
+  parseOcclusions,
+  planOcclusionTracks,
+  serializeTrackCsv,
+} from './lib/occlusion';
 import { CalibratePanel } from './components/CalibratePanel';
 import { DedupePanel } from './components/DedupePanel';
 import { EditPanel } from './components/EditPanel';
 import { ExportPanel } from './components/ExportPanel';
 import { GroupCard } from './components/GroupCard';
 import { ImportPanel } from './components/ImportPanel';
+import { OcclusionPanel } from './components/OcclusionPanel';
 import { PacePanel } from './components/PacePanel';
 import { RecalibrateMigrateDialog } from './components/RecalibrateMigrateDialog';
 import { SnapPanel } from './components/SnapPanel';
@@ -56,8 +62,8 @@ import { WrapPanel } from './components/WrapPanel';
 const PAGE_SIZE = 80;
 const STEP_LABELS = ['导入双版本', '时间轴校准', '顺序对齐', '解决冲突', '校验导出'];
 
-function download(filename: string, content: string) {
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+function download(filename: string, content: string, mime = 'text/plain;charset=utf-8') {
+  const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -108,7 +114,9 @@ export default function App() {
   const cuesBEff: Cue[] = groups ? (cuesBUsed ?? cuesB) : cuesB;
 
   // 智能断行：视图切换、参数与逐条应用状态（key 为 groupIndex）
-  const [view, setView] = useState<'groups' | 'dedupe' | 'wrap' | 'pace' | 'snap' | 'edit'>('groups');
+  const [view, setView] = useState<'groups' | 'dedupe' | 'wrap' | 'pace' | 'snap' | 'edit' | 'occlusion'>(
+    'groups',
+  );
   const [wrapOpts, setWrapOpts] = useState<WrapOptions>({
     maxWidth: 42,
     maxLines: 2,
@@ -136,6 +144,10 @@ export default function App() {
   // 剪辑版字幕（独立模块，只读 finalCues）：源片段列表文本（每行 起点ms 终点ms），
   // 输入或上游结果变化时通过 useMemo 立即重算，不写回合并结果
   const [segmentText, setSegmentText] = useState('');
+
+  // 字幕遮挡避让（独立模块，只读 finalCues）：遮挡列表文本（每行
+  // 起点ms 终点ms 上/下），输入或上游结果变化时通过 useMemo 立即重算，不写回
+  const [occlusionText, setOcclusionText] = useState('');
 
   // 重新校准并迁移审校决定：从工作区进入校准页时保留旧 groups/states；
   // 新对齐算出后先在弹窗中预览迁移方案，确认后才一次提交，取消则旧工作区原封不动。
@@ -656,6 +668,42 @@ export default function App() {
                   : '';
   const canDownloadEdited = editedReason === '';
 
+  // 字幕遮挡避让：解析遮挡列表 → 在最终合并字幕上求上/下轨道方案。
+  // 只读 finalCues；任一条两轨均被遮挡时无全局方案，不导出部分结果。
+  const occParse = useMemo(() => parseOcclusions(occlusionText), [occlusionText]);
+  const occPlan = useMemo(
+    () => planOcclusionTracks(finalCues, occParse.occlusions),
+    [finalCues, occParse],
+  );
+  const occCsv = useMemo(
+    () => (occPlan.ok ? serializeTrackCsv(occPlan.items, formatTimecode) : ''),
+    [occPlan],
+  );
+  const occCsvPreview = useMemo(() => {
+    if (!occPlan.ok) return '';
+    return occCsv.length > 20000
+      ? `${occCsv.slice(0, 20000)}\n…（共 ${occPlan.items.length} 条，预览已截断）`
+      : occCsv;
+  }, [occCsv, occPlan]);
+  // 下载门槛：遮挡行无格式错误且至少一条、上游可导出、存在可行完整方案
+  const occReason =
+    !groups
+      ? '尚无上游结果'
+      : unresolved > 0
+        ? `上游还有 ${unresolved} 个未解决冲突`
+        : issues.length > 0
+          ? `上游存在 ${issues.length} 个校验错误`
+          : finalCues.length === 0
+            ? '上游结果为空'
+            : occParse.invalid.length > 0
+              ? `遮挡列表第 ${occParse.invalid.map((b) => b.line).join('、')} 行格式错误`
+              : occParse.occlusions.length === 0
+                ? '请先填写遮挡列表'
+                : !occPlan.ok
+                  ? occPlan.reason
+                  : '';
+  const canDownloadOcc = occReason === '';
+
   const preview = useMemo(() => {
     if (!groups) return '';
     const full = serializeSrt(finalCues);
@@ -834,6 +882,13 @@ export default function App() {
                     剪辑版字幕
                     <span className="tab-count">{editedCues.length}</span>
                   </button>
+                  <button
+                    className={`tab ${view === 'occlusion' ? 'active' : ''}`}
+                    onClick={() => setView('occlusion')}
+                  >
+                    字幕遮挡避让
+                    <span className="tab-count">{occPlan.ok ? occPlan.topCount : 0}</span>
+                  </button>
                 </div>
                 {view === 'groups' ? (
                   <>
@@ -937,6 +992,22 @@ export default function App() {
                     canDownload={canDownloadEdited}
                     downloadReason={editedReason}
                     onDownload={() => download('edited.srt', '\uFEFF' + editedSrt)}
+                  />
+                )}
+                {view === 'occlusion' && (
+                  <OcclusionPanel
+                    sourceCount={finalCues.length}
+                    sourceReady={canExport}
+                    occlusionText={occlusionText}
+                    onOcclusionText={setOcclusionText}
+                    parsed={occParse}
+                    plan={occPlan}
+                    csvPreview={occCsvPreview}
+                    canDownload={canDownloadOcc}
+                    downloadReason={occReason}
+                    onDownload={() =>
+                      download('occlusion-tracks.csv', '\uFEFF' + occCsv, 'text/csv;charset=utf-8')
+                    }
                   />
                 )}
               </main>
