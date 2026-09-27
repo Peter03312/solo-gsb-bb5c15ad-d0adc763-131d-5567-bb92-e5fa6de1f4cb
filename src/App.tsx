@@ -29,6 +29,7 @@ import {
   DEFAULT_PACE_OPTIONS,
   type PaceOptions,
 } from './lib/pace';
+import { buildTrackCsv, parseOcclusions, planTracks } from './lib/occlude';
 import { SAMPLE_A, SAMPLE_B } from './lib/samples';
 import { parseSrt, serializeSrt, type Cue } from './lib/srt';
 import { applyScrollChains, findScrollChains, type ScrollOptions } from './lib/scroll';
@@ -46,6 +47,7 @@ import { EditPanel } from './components/EditPanel';
 import { ExportPanel } from './components/ExportPanel';
 import { GroupCard } from './components/GroupCard';
 import { ImportPanel } from './components/ImportPanel';
+import { OccludePanel } from './components/OccludePanel';
 import { PacePanel } from './components/PacePanel';
 import { RecalibrateMigrateDialog } from './components/RecalibrateMigrateDialog';
 import { SnapPanel } from './components/SnapPanel';
@@ -108,7 +110,9 @@ export default function App() {
   const cuesBEff: Cue[] = groups ? (cuesBUsed ?? cuesB) : cuesB;
 
   // 智能断行：视图切换、参数与逐条应用状态（key 为 groupIndex）
-  const [view, setView] = useState<'groups' | 'dedupe' | 'wrap' | 'pace' | 'snap' | 'edit'>('groups');
+  const [view, setView] = useState<
+    'groups' | 'dedupe' | 'wrap' | 'pace' | 'snap' | 'edit' | 'occlude'
+  >('groups');
   const [wrapOpts, setWrapOpts] = useState<WrapOptions>({
     maxWidth: 42,
     maxLines: 2,
@@ -136,6 +140,10 @@ export default function App() {
   // 剪辑版字幕（独立模块，只读 finalCues）：源片段列表文本（每行 起点ms 终点ms），
   // 输入或上游结果变化时通过 useMemo 立即重算，不写回合并结果
   const [segmentText, setSegmentText] = useState('');
+
+  // 字幕遮挡避让（独立模块，只读 finalCues）：遮挡区间列表文本
+  // （每行 起点ms 终点ms 上/下），输入或上游结果变化时立即重算轨道分配
+  const [occText, setOccText] = useState('');
 
   // 重新校准并迁移审校决定：从工作区进入校准页时保留旧 groups/states；
   // 新对齐算出后先在弹窗中预览迁移方案，确认后才一次提交，取消则旧工作区原封不动。
@@ -656,6 +664,34 @@ export default function App() {
                   : '';
   const canDownloadEdited = editedReason === '';
 
+  // 字幕遮挡避让：解析遮挡列表 → 在最终合并结果上做全局轨道分配。输入或上游
+  // finalCues 变化立即重算；仅读取 finalCues，绝不修改合并结果，也不改变 SRT。
+  const occParse = useMemo(() => parseOcclusions(occText), [occText]);
+  const occPlan = useMemo(
+    () => planTracks(finalCues, occParse.occlusions),
+    [finalCues, occParse],
+  );
+  const occCsv = useMemo(
+    () => (occPlan.ok ? buildTrackCsv(finalCues, occPlan.tracks) : ''),
+    [finalCues, occPlan],
+  );
+  // 下载门槛：遮挡列表无格式错误、上游可导出、存在完整方案（无两轨均被遮挡的字幕）
+  const occReason =
+    !groups
+      ? '尚无上游结果'
+      : unresolved > 0
+        ? `上游还有 ${unresolved} 个未解决冲突`
+        : issues.length > 0
+          ? `上游存在 ${issues.length} 个校验错误`
+          : finalCues.length === 0
+            ? '上游结果为空'
+            : occParse.invalid.length > 0
+              ? `遮挡列表第 ${occParse.invalid.map((b) => b.line).join('、')} 行格式错误`
+              : !occPlan.ok
+                ? `第 ${occPlan.failIndex + 1} 条字幕两轨均被遮挡，无完整方案`
+                : '';
+  const canDownloadOcc = occReason === '';
+
   const preview = useMemo(() => {
     if (!groups) return '';
     const full = serializeSrt(finalCues);
@@ -834,6 +870,13 @@ export default function App() {
                     剪辑版字幕
                     <span className="tab-count">{editedCues.length}</span>
                   </button>
+                  <button
+                    className={`tab ${view === 'occlude' ? 'active' : ''}`}
+                    onClick={() => setView('occlude')}
+                  >
+                    字幕遮挡避让
+                    <span className="tab-count">{occPlan.ok ? occPlan.topCount : '✗'}</span>
+                  </button>
                 </div>
                 {view === 'groups' ? (
                   <>
@@ -907,7 +950,7 @@ export default function App() {
                     onAcceptAll={acceptAllPace}
                     onRestoreAll={restoreAllPace}
                   />
-                ) : (
+                ) : view === 'snap' ? (
                   <SnapPanel
                     cues={pacedCues}
                     plan={snapPlan}
@@ -922,8 +965,7 @@ export default function App() {
                     onAcceptAll={acceptAllSnaps}
                     onRestoreAll={restoreAllSnaps}
                   />
-                )}
-                {view === 'edit' && (
+                ) : view === 'edit' ? (
                   <EditPanel
                     sourceCount={finalCues.length}
                     sourceReady={canExport}
@@ -937,6 +979,19 @@ export default function App() {
                     canDownload={canDownloadEdited}
                     downloadReason={editedReason}
                     onDownload={() => download('edited.srt', '\uFEFF' + editedSrt)}
+                  />
+                ) : (
+                  <OccludePanel
+                    sourceCount={finalCues.length}
+                    sourceReady={canExport}
+                    occText={occText}
+                    onOccText={setOccText}
+                    parsed={occParse}
+                    cues={finalCues}
+                    plan={occPlan}
+                    canDownload={canDownloadOcc}
+                    downloadReason={occReason}
+                    onDownload={() => download('tracks.csv', '\uFEFF' + occCsv)}
                   />
                 )}
               </main>
